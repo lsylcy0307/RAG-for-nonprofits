@@ -1,39 +1,68 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Three tables:
+#   pf_foundations   one row per 990-PF filing
+#   pf_grantees      one row per unique grantee — description lives here
+#   pf_grants        one row per grant — links foundation to grantee
+#
+# Key design: grantee descriptions live in pf_grantees, not pf_grants.
+# The same grantee (e.g. Boys and Girls Club) appears across many foundation
+# filings — storing the description once and joining is cleaner than
+# duplicating it on every grant row and managing cache invalidation.
+#
+# When Phase 2 adds standard 990 program descriptions, update
+# pf_grantees.description and set description_source = '990_program'.
+# Then reset embedding_status = 'PENDING' on all grants for that grantee
+# to trigger re-embedding with the richer text.
+# ─────────────────────────────────────────────────────────────────────────────
+
 resource "google_bigquery_table" "pf_foundations" {
   dataset_id          = google_bigquery_dataset.query_dataset.dataset_id
   table_id            = "pf_foundations"
   deletion_protection = false
 
   schema = jsonencode([
-    # ── Identity ──────────────────────────────────────────────────────────────
-    { name = "foundation_id", type = "STRING", mode = "REQUIRED",
-    description = "SHA-256 of ein+tax_period+filename — stable across re-ingests" },
-    { name = "ein", type = "STRING", mode = "REQUIRED" },
-    { name = "organization_name", type = "STRING", mode = "NULLABLE" },
-
-    # ── Time ──────────────────────────────────────────────────────────────────
-    { name = "filing_year", type = "INTEGER", mode = "NULLABLE" },
-    { name = "tax_period", type = "STRING", mode = "NULLABLE" },
-
-    # ── Location ──────────────────────────────────────────────────────────────
-    { name = "state", type = "STRING", mode = "NULLABLE",
-    description = "State where the foundation is registered (OrgReportOrRegisterStateCd)" },
-
-    # ── Financials ────────────────────────────────────────────────────────────
-    { name = "fmv_assets_raw", type = "STRING", mode = "NULLABLE",
-    description = "Fair market value of assets EOY — better than book value for sizing grantmaking capacity" },
-    { name = "total_revenue_raw", type = "STRING", mode = "NULLABLE" },
-    { name = "total_expenses_raw", type = "STRING", mode = "NULLABLE" },
-    { name = "total_grants_paid_raw", type = "STRING", mode = "NULLABLE",
-    description = "Total contributions paid during the year" },
-
-    # ── Application eligibility ───────────────────────────────────────────────
+    { name = "foundation_id",     type = "STRING",    mode = "REQUIRED",
+      description = "SHA-256 of ein+tax_period+filename" },
+    { name = "ein",               type = "STRING",    mode = "REQUIRED"  },
+    { name = "organization_name", type = "STRING",    mode = "NULLABLE"  },
+    { name = "filing_year",       type = "INTEGER",   mode = "NULLABLE"  },
+    { name = "tax_period",        type = "STRING",    mode = "NULLABLE"  },
+    { name = "state",             type = "STRING",    mode = "NULLABLE"  },
+    { name = "fmv_assets_raw",        type = "STRING", mode = "NULLABLE",
+      description = "Fair market value of assets EOY" },
+    { name = "total_revenue_raw",     type = "STRING", mode = "NULLABLE" },
+    { name = "total_expenses_raw",    type = "STRING", mode = "NULLABLE" },
+    { name = "total_grants_paid_raw", type = "STRING", mode = "NULLABLE" },
     { name = "accepts_unsolicited_apps", type = "BOOLEAN", mode = "NULLABLE",
-    description = "false = invitation-only (OnlyContriToPreselectedInd=X), true = open to proposals, null = not specified" },
+      description = "false=invitation-only, true=open, null=not specified" },
+    { name = "xml_filename",      type = "STRING",    mode = "NULLABLE"  },
+    { name = "gcs_path",          type = "STRING",    mode = "NULLABLE"  },
+    { name = "created_at",        type = "TIMESTAMP", mode = "REQUIRED"  },
+  ])
+}
 
-    # ── Source tracking ───────────────────────────────────────────────────────
-    { name = "xml_filename", type = "STRING", mode = "NULLABLE" },
-    { name = "gcs_path", type = "STRING", mode = "NULLABLE" },
-    { name = "created_at", type = "TIMESTAMP", mode = "REQUIRED" },
+resource "google_bigquery_table" "pf_grantees" {
+  dataset_id          = google_bigquery_dataset.query_dataset.dataset_id
+  table_id            = "pf_grantees"
+  deletion_protection = false
+
+  schema = jsonencode([
+    { name = "grantee_id",   type = "STRING",    mode = "REQUIRED",
+      description = "SHA-256 of normalized (grantee_name + grantee_state) — stable across filings" },
+    { name = "grantee_name",  type = "STRING",   mode = "NULLABLE" },
+    { name = "grantee_state", type = "STRING",   mode = "NULLABLE" },
+    { name = "grantee_city",  type = "STRING",   mode = "NULLABLE" },
+
+    # Description of what the grantee does — used to build embed text.
+    # Source priority: 990_program (real filing) > llm (Claude inference)
+    { name = "description",        type = "STRING", mode = "NULLABLE",
+      description = "What this grantee does — one sentence used in embed text" },
+    { name = "description_source", type = "STRING", mode = "NULLABLE",
+      description = "'llm' = Claude-generated, '990_program' = from grantee's own 990 filing" },
+
+    { name = "created_at",  type = "TIMESTAMP", mode = "REQUIRED" },
+    { name = "updated_at",  type = "TIMESTAMP", mode = "NULLABLE",
+      description = "Set when description is upgraded from llm to 990_program" },
   ])
 }
 
@@ -43,45 +72,31 @@ resource "google_bigquery_table" "pf_grants" {
   deletion_protection = false
 
   schema = jsonencode([
-    # ── Identity ──────────────────────────────────────────────────────────────
-    { name = "grant_id", type = "STRING", mode = "REQUIRED",
-    description = "SHA-256 of foundation_id+index — also used as Pinecone vector ID" },
+    { name = "grant_id",      type = "STRING", mode = "REQUIRED",
+      description = "SHA-256 of foundation_id+index — also used as Pinecone vector ID" },
     { name = "foundation_id", type = "STRING", mode = "REQUIRED",
-    description = "FK to pf_foundations.foundation_id" },
+      description = "FK to pf_foundations.foundation_id" },
+    { name = "grantee_id",    type = "STRING", mode = "NULLABLE",
+      description = "FK to pf_grantees.grantee_id" },
 
-    # ── Filer (the foundation making the grant) ───────────────────────────────
-    { name = "filer_ein", type = "STRING", mode = "NULLABLE" },
-    { name = "filer_name", type = "STRING", mode = "NULLABLE" },
+    { name = "filer_ein",   type = "STRING", mode = "NULLABLE" },
+    { name = "filer_name",  type = "STRING", mode = "NULLABLE" },
     { name = "filer_state", type = "STRING", mode = "NULLABLE" },
 
-    # ── Grantee (who received the money) ─────────────────────────────────────
-    { name = "grantee_name", type = "STRING", mode = "NULLABLE" },
-    { name = "grantee_city", type = "STRING", mode = "NULLABLE" },
+    # Kept for display without needing a join
+    { name = "grantee_name",  type = "STRING", mode = "NULLABLE" },
+    { name = "grantee_city",  type = "STRING", mode = "NULLABLE" },
     { name = "grantee_state", type = "STRING", mode = "NULLABLE" },
 
-    # ── Grant details ─────────────────────────────────────────────────────────
     { name = "grant_amount_raw", type = "STRING", mode = "NULLABLE" },
-    { name = "grant_purpose", type = "STRING", mode = "NULLABLE",
-    description = "Raw purpose text from the filing — may be generic boilerplate" },
+    { name = "grant_purpose",    type = "STRING", mode = "NULLABLE",
+      description = "Raw purpose text — may be generic boilerplate" },
 
-    # ── Embedding pipeline ────────────────────────────────────────────────────
-    # Step 1 — built at parse time by ingest_990pf.py
-    # Generic purposes stripped. Format: "Foundation (state) | Grantee (state) | purpose"
     { name = "embed_text", type = "STRING", mode = "NULLABLE",
-    description = "Base embed text built at parse time. Generic purposes stripped. Used as fallback when enriched_embed_text is null." },
+      description = "Base embed text built at parse time (generic purposes stripped). Fallback when grantee has no description yet." },
 
-    # Step 2 — built by enrich_990pf.py using Claude
-    # Claude generates a specific one-sentence description of what the grantee
-    # does based on name, location, and purpose — replacing vague boilerplate
-    # with semantically rich text. Stored here because it is expensive to
-    # regenerate (API cost) and non-deterministic across runs.
-    # Format: "Foundation (state) | Grantee (state) | Claude description"
-    { name = "enriched_embed_text", type = "STRING", mode = "NULLABLE",
-    description = "LLM-enriched embed text from enrich_990pf.py. Used by embed script when available, falls back to embed_text when null." },
-
-    # Step 3 — set by embed_990pf.py after upserting to Pinecone
     { name = "embedding_status", type = "STRING", mode = "NULLABLE",
-    description = "PENDING → COMPLETED once vector upserted to Pinecone. Embed script filters WHERE embedding_status = PENDING." },
+      description = "PENDING → COMPLETED. Reset to PENDING when grantee description is upgraded." },
 
     { name = "created_at", type = "TIMESTAMP", mode = "REQUIRED" },
   ])

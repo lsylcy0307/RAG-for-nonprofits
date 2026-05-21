@@ -1,22 +1,18 @@
 """
 IRS 990-PF parser — ingests private foundation filings into BigQuery.
 
-Writes to two tables:
-  pf_foundations  one row per filing  (who the foundation is + financials)
-  pf_grants       one row per grant   (who they funded + embed_text for Pinecone)
-
-The embed_text field is built at parse time so the embed script just reads
-and upserts — no extra joins needed. Generic purpose phrases like
-"PROVIDE OPERATING FUNDS" are stripped so the vector carries real signal
-(foundation name + grantee name + location). Specific purpose text is kept.
+Writes to three tables:
+  pf_foundations  one row per filing
+  pf_grantees     one row per unique grantee (deduped by name+state)
+  pf_grants       one row per grant, linked to both tables via FKs
 
 Usage
 -----
 python ingest_990pf.py \
-    --project_id my-project \
-    --dataset_id irs_data \
-    --bucket_name my-bucket \
-    --prefix raw/irs_990_xml/2024_990PF/ \
+    --project_id ai-agent-platform-496418 \
+    --dataset_id query_dataset \
+    --bucket_name ai-agent-platform-496418-ai-documents \
+    --prefix raw/irs_990_xml/2025_990PF_TEST/ \
     [--limit 100] \
     [--dry_run]
 """
@@ -42,33 +38,20 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Namespace ─────────────────────────────────────────────────────────────────
-
 _NS_URI = "http://www.irs.gov/efile"
 _NS     = {"ns": _NS_URI}
 _Q      = f"{{{_NS_URI}}}"
 
-# ── Purpose phrases that carry no semantic meaning ────────────────────────────
-# When a grant purpose matches one of these we omit it from embed_text so the
-# vector is based on foundation + grantee names/locations instead of noise.
-
 _GENERIC_PURPOSES = {
-    "provide operating funds",
-    "provide operating support",
-    "provide operatings funds",   # common typo in filings
-    "general operating support",
-    "general support",
-    "operating support",
-    "support",
-    "charitable contribution",
-    "charitable purposes",
-    "charitable support",
-    "n/a",
-    "none",
+    "provide operating funds", "provide operating support",
+    "provide operatings funds", "general operating support",
+    "general support", "operating support", "support",
+    "charitable contribution", "charitable purposes",
+    "charitable support", "n/a", "none",
 }
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Utilities ─────────────────────────────────────────────────────────────────
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -76,7 +59,7 @@ def now_iso() -> str:
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
-def _first(node: ET.Element | None, *xpaths: str) -> str | None:
+def _first(node, *xpaths):
     if node is None:
         return None
     for xpath in xpaths:
@@ -85,7 +68,7 @@ def _first(node: ET.Element | None, *xpaths: str) -> str | None:
             return el.text.strip()
     return None
 
-def _iter_first(node: ET.Element | None, *local_tags: str) -> str | None:
+def _iter_first(node, *local_tags):
     if node is None:
         return None
     for tag in local_tags:
@@ -94,38 +77,20 @@ def _iter_first(node: ET.Element | None, *local_tags: str) -> str | None:
                 return el.text.strip()
     return None
 
-def _is_generic_purpose(purpose: str | None) -> bool:
+def _grantee_id(name: str | None, state: str | None) -> str:
+    """Stable ID for a grantee — normalized so minor formatting differences match."""
+    key = f"{(name or '').strip().upper()}-{(state or '').strip().upper()}"
+    return _sha(key)
+
+def _is_generic(purpose: str | None) -> bool:
     return (purpose or "").strip().lower() in _GENERIC_PURPOSES
 
-def _build_embed_text(
-    filer_name: str | None,
-    filer_state: str | None,
-    grantee_name: str | None,
-    grantee_state: str | None,
-    purpose: str | None,
-) -> str:
-    """
-    Build the text that will be embedded as a vector.
-
-    Format: "{foundation} ({state}) | {grantee} ({state}) | {purpose}"
-    Purpose is omitted when it's generic boilerplate — the signal then comes
-    entirely from who the foundation is and who they chose to fund.
-
-    Example (generic purpose):
-      "ASHCOURT FAMILY FOUNDATION INC (FL) | MOFFITT CANCER CENTER (FL)"
-
-    Example (specific purpose):
-      "JOSEPH D SARGENT FUND (CT) | HARTFORD HOSPITAL (CT) |
-       FUNDS ARE USED IN HARTFORD HOSPITAL'S CENTER FOR EDUCATION,
-       SIMULATION AND INNOVATION"
-    """
-    filer_part   = f"{filer_name} ({filer_state})"   if filer_state   else filer_name
-    grantee_part = f"{grantee_name} ({grantee_state})" if grantee_state else grantee_name
-
-    parts = [filer_part, grantee_part]
-    if purpose and not _is_generic_purpose(purpose):
+def _build_embed_text(filer_name, filer_state, grantee_name, grantee_state, purpose):
+    filer   = f"{filer_name} ({filer_state})"   if filer_state   else filer_name
+    grantee = f"{grantee_name} ({grantee_state})" if grantee_state else grantee_name
+    parts   = [filer, grantee]
+    if purpose and not _is_generic(purpose):
         parts.append(purpose)
-
     return " | ".join(p for p in parts if p)
 
 
@@ -135,19 +100,18 @@ def parse_990pf(
     xml_bytes: bytes,
     filename: str,
     gcs_path: str,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     """
     Parse one 990-PF XML file.
 
     Returns
     -------
-    (foundation_row, grant_rows)
+    (foundation_row, grantee_rows, grant_rows)
     """
     root   = ET.fromstring(xml_bytes)
     header = root.find("ns:ReturnHeader", _NS)
     rd     = root.find(f"{_Q}ReturnData")
 
-    # ── Identity ──────────────────────────────────────────────────────────────
     ein = _first(header, "ns:Filer/ns:EIN")
     org_name = _first(
         header,
@@ -167,45 +131,34 @@ def parse_990pf(
 
     foundation_id = _sha(f"{ein}-{tax_period}-{filename}")
 
-    # ── 990-PF body ───────────────────────────────────────────────────────────
-    pf = rd.find(f"{_Q}IRS990PF") if rd is not None else None
-
-    state          = _iter_first(pf, "OrgReportOrRegisterStateCd")
-    fmv_assets     = _iter_first(pf, "FMVAssetsEOYAmt", "TotalAssetsEOYFMVAmt")
-    total_expenses = _iter_first(pf, "TotalExpensesRevAndExpnssAmt")
-    total_revenue  = _iter_first(pf, "TotalRevAndExpnssAmt")
-
-    # ── SupplementaryInformationGrp (grants + application eligibility) ────────
+    pf   = rd.find(f"{_Q}IRS990PF") if rd is not None else None
     supp = pf.find(f"{_Q}SupplementaryInformationGrp") if pf is not None else None
 
-    # OnlyContriToPreselectedInd = "X" means invitation-only
     only_preselected = supp.find(f"{_Q}OnlyContriToPreselectedInd") if supp is not None else None
     accepts_unsolicited: bool | None = None
     if only_preselected is not None:
         accepts_unsolicited = (only_preselected.text or "").strip() != "X"
 
-    total_grants_paid = _first(supp, "ns:TotalGrantOrContriPdDurYrAmt")
-
-    # ── Foundation row ────────────────────────────────────────────────────────
     foundation_row: dict[str, Any] = {
-        "foundation_id":           foundation_id,
-        "ein":                     ein or "UNKNOWN",
-        "organization_name":       org_name,
-        "filing_year":             filing_year,
-        "tax_period":              tax_period,
-        "state":                   state,
-        "fmv_assets_raw":          fmv_assets,
-        "total_revenue_raw":       total_revenue,
-        "total_expenses_raw":      total_expenses,
-        "total_grants_paid_raw":   total_grants_paid,
+        "foundation_id":            foundation_id,
+        "ein":                      ein or "UNKNOWN",
+        "organization_name":        org_name,
+        "filing_year":              filing_year,
+        "tax_period":               tax_period,
+        "state":                    _iter_first(pf, "OrgReportOrRegisterStateCd"),
+        "fmv_assets_raw":           _iter_first(pf, "FMVAssetsEOYAmt", "TotalAssetsEOYFMVAmt"),
+        "total_revenue_raw":        _iter_first(pf, "TotalRevAndExpnssAmt"),
+        "total_expenses_raw":       _iter_first(pf, "TotalExpensesRevAndExpnssAmt"),
+        "total_grants_paid_raw":    _first(supp, "ns:TotalGrantOrContriPdDurYrAmt"),
         "accepts_unsolicited_apps": accepts_unsolicited,
-        "xml_filename":            filename,
-        "gcs_path":                gcs_path,
-        "created_at":              now_iso(),
+        "xml_filename":             filename,
+        "gcs_path":                 gcs_path,
+        "created_at":               now_iso(),
     }
 
-    # ── Grant rows ────────────────────────────────────────────────────────────
-    grant_rows: list[dict[str, Any]] = []
+    grantee_rows: list[dict[str, Any]] = []
+    grant_rows:   list[dict[str, Any]] = []
+    seen_grantees: set[str]            = set()
 
     if supp is not None:
         for i, grp in enumerate(supp.findall(f"{_Q}GrantOrContributionPdDurYrGrp")):
@@ -222,9 +175,25 @@ def parse_990pf(
             if not grantee_name:
                 continue
 
+            gid = _grantee_id(grantee_name, grantee_state)
+
+            # Collect unique grantees encountered in this file
+            if gid not in seen_grantees:
+                seen_grantees.add(gid)
+                grantee_rows.append({
+                    "grantee_id":         gid,
+                    "grantee_name":       grantee_name,
+                    "grantee_state":      grantee_state,
+                    "grantee_city":       grantee_city,
+                    "description":        None,   # filled by enrich_990pf.py
+                    "description_source": None,
+                    "created_at":         now_iso(),
+                    "updated_at":         None,
+                })
+
             embed_text = _build_embed_text(
                 filer_name=org_name,
-                filer_state=state,
+                filer_state=foundation_row["state"],
                 grantee_name=grantee_name,
                 grantee_state=grantee_state,
                 purpose=purpose,
@@ -233,9 +202,10 @@ def parse_990pf(
             grant_rows.append({
                 "grant_id":         _sha(f"{foundation_id}-grant-{i}"),
                 "foundation_id":    foundation_id,
+                "grantee_id":       gid,
                 "filer_ein":        ein or "UNKNOWN",
                 "filer_name":       org_name,
-                "filer_state":      state,
+                "filer_state":      foundation_row["state"],
                 "grantee_name":     grantee_name,
                 "grantee_city":     grantee_city,
                 "grantee_state":    grantee_state,
@@ -246,10 +216,10 @@ def parse_990pf(
                 "created_at":       now_iso(),
             })
 
-    return foundation_row, grant_rows
+    return foundation_row, grantee_rows, grant_rows
 
 
-# ── BigQuery ──────────────────────────────────────────────────────────────────
+# ── BigQuery helpers ──────────────────────────────────────────────────────────
 
 def insert_rows(
     client: bigquery.Client,
@@ -267,6 +237,73 @@ def insert_rows(
         raise RuntimeError(f"BigQuery insert failed for {table_id}: {errors}")
 
 
+def insert_new_grantees(
+    client: bigquery.Client,
+    table_id: str,
+    grantees: list[dict[str, Any]],
+    dry_run: bool = False,
+) -> None:
+    """
+    Insert only grantees that don't already exist in BigQuery.
+    Checks by grantee_id so re-running ingest never creates duplicates.
+    """
+    if not grantees or dry_run:
+        if dry_run and grantees:
+            log.info("[dry_run] Would upsert %d grantees into %s", len(grantees), table_id)
+        return
+
+    # Deduplicate within this batch first
+    seen:   set[str]            = set()
+    unique: list[dict[str, Any]] = []
+    for g in grantees:
+        if g["grantee_id"] not in seen:
+            seen.add(g["grantee_id"])
+            unique.append(g)
+
+    # Check which grantee_ids already exist in BigQuery
+    ids_sql  = ", ".join(f"'{g['grantee_id']}'" for g in unique)
+    existing = {
+        row["grantee_id"]
+        for row in client.query(f"""
+            SELECT grantee_id
+            FROM `{table_id}`
+            WHERE grantee_id IN ({ids_sql})
+        """).result()
+    }
+
+    new_grantees = [g for g in unique if g["grantee_id"] not in existing]
+
+    if new_grantees:
+        # Use DML INSERT (not streaming) so rows are immediately mutable.
+        # Streaming inserts go into a buffer that BigQuery won't let you
+        # UPDATE/DELETE for up to 90 minutes — enrich_990pf.py needs to
+        # UPDATE these rows right after ingest.
+        #
+        # Use parameterized queries to handle ALL special characters
+        # (apostrophes, quotes, backslashes) without manual escaping.
+        for g in new_grantees:
+            client.query(
+                f"""
+                INSERT INTO `{table_id}`
+                    (grantee_id, grantee_name, grantee_state, grantee_city,
+                     description, description_source, created_at, updated_at)
+                VALUES
+                    (@grantee_id, @grantee_name, @grantee_state, @grantee_city,
+                     NULL, NULL, @created_at, NULL)
+                """,
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter("grantee_id",    "STRING", g["grantee_id"]),
+                        bigquery.ScalarQueryParameter("grantee_name",  "STRING", g.get("grantee_name")  or ""),
+                        bigquery.ScalarQueryParameter("grantee_state", "STRING", g.get("grantee_state") or ""),
+                        bigquery.ScalarQueryParameter("grantee_city",  "STRING", g.get("grantee_city")  or ""),
+                        bigquery.ScalarQueryParameter("created_at",    "STRING", g["created_at"]),
+                    ]
+                )
+            ).result()
+        log.info("  Inserted %d new grantees (%d already existed)", len(new_grantees), len(existing))
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def ingest_gcs_prefix(
@@ -281,6 +318,7 @@ def ingest_gcs_prefix(
     bq_client      = bigquery.Client(project=project_id)
 
     foundations_table = f"{project_id}.{dataset_id}.pf_foundations"
+    grantees_table    = f"{project_id}.{dataset_id}.pf_grantees"
     grants_table      = f"{project_id}.{dataset_id}.pf_grants"
 
     xml_blobs = [
@@ -297,19 +335,22 @@ def ingest_gcs_prefix(
     for blob in xml_blobs:
         log.info("Ingesting: %s", blob.name)
         try:
-            xml_bytes  = blob.download_as_bytes()
-            foundation_row, grant_rows = parse_990pf(
+            xml_bytes = blob.download_as_bytes()
+            foundation_row, grantee_rows, grant_rows = parse_990pf(
                 xml_bytes=xml_bytes,
                 filename=Path(blob.name).name,
                 gcs_path=f"gs://{bucket_name}/{blob.name}",
             )
             insert_rows(bq_client, foundations_table, [foundation_row], dry_run)
-            insert_rows(bq_client, grants_table,      grant_rows,       dry_run)
+            insert_new_grantees(bq_client, grantees_table, grantee_rows, dry_run)
+            insert_rows(bq_client, grants_table, grant_rows, dry_run)
+
             log.info(
-                "  → %s (%s) | %d grants | unsolicited=%s",
+                "  → %s (%s) | %d grants | %d grantees | unsolicited=%s",
                 foundation_row["organization_name"],
                 foundation_row["state"],
                 len(grant_rows),
+                len(grantee_rows),
                 foundation_row["accepts_unsolicited_apps"],
             )
             ok += 1

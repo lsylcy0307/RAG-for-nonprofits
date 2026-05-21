@@ -1,9 +1,8 @@
 fastapi
 uvicorn[standard]
-google-cloud-aiplatform
-google-cloud-storage
-google-cloud-bigquery
-lxml
-pinecone
-anthropic
 pydantic
+anthropic
+pinecone
+google-cloud-aiplatform
+google-cloud-bigquery
+google-cloud-storage
