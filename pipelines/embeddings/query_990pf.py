@@ -179,9 +179,14 @@ def rerank(
             "role": "user",
             "content": (
                 f"Query: {query}\n\n"
+                f"You are helping a nonprofit fundraiser find funders. "
                 f"Rank these foundation grant records by relevance to the query "
-                f"(most relevant first). Return ONLY a comma-separated list of "
-                f"numbers, nothing else.\n\n{candidates}"
+                f"(most relevant first). Prioritize records where: "
+                f"(1) the grantee's work closely matches the query topic, "
+                f"(2) the location matches if specified, "
+                f"(3) the foundation accepts unsolicited proposals if possible.\n\n"
+                f"Return ONLY a comma-separated list of numbers, nothing else.\n\n"
+                f"{candidates}"
             )
         }]
     )
@@ -270,9 +275,9 @@ def main() -> None:
     pinecone_filter: dict = {}
 
     if len(states) == 1:
-        pinecone_filter["state"] = {"$eq": states[0]}
+        pinecone_filter["grantee_state_filter"] = {"$eq": states[0]}
     elif len(states) > 1:
-        pinecone_filter["state"] = {"$in": states}
+        pinecone_filter["grantee_state_filter"] = {"$in": states}
 
     if grant_size:
         pinecone_filter["grant_size"] = {"$eq": grant_size}
@@ -298,8 +303,23 @@ def main() -> None:
         return
 
     # ── Rerank ────────────────────────────────────────────────────────────────
-    log.info("Reranking %d candidates → top %d...", len(matches), args.top_k)
-    matches = rerank(anthropic_client, args.query, matches, args.top_k)
+    # Only rerank when there are enough candidates to meaningfully reorder.
+    RERANK_THRESHOLD = 10
+
+    should_rerank = (
+        len(matches) > RERANK_THRESHOLD
+        and args.top_k < len(matches)
+    )
+
+    if should_rerank:
+        log.info("Reranking %d candidates → top %d...", len(matches), args.top_k)
+        matches = rerank(anthropic_client, args.query, matches, args.top_k)
+    else:
+        log.info(
+            "Skipping rerank — only %d candidates (threshold=%d)",
+            len(matches), RERANK_THRESHOLD,
+        )
+        matches = matches[:args.top_k]
 
     # ── Display ───────────────────────────────────────────────────────────────
     print(f'\nQuery: "{args.query}"')
