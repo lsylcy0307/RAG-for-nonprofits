@@ -4,7 +4,7 @@ steps:
       - "build"
       - "-t"
       - "us-central1-docker.pkg.dev/$PROJECT_ID/agent-platform/agent-api:latest"
-      - "./backend"
+      - "."
 
   - name: "gcr.io/cloud-builders/docker"
     args:
