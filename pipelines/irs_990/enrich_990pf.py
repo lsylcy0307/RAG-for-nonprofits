@@ -1,20 +1,13 @@
 """
-Enrich pf_grantees with LLM-generated descriptions.
+Enrich pf_grantees with LLM-generated descriptions (parallel).
 
-Queries pf_grantees WHERE description IS NULL, calls Claude once per row,
-and writes the result back. No deduplication logic needed — each row in
-pf_grantees IS already a unique grantee.
+Runs Claude calls concurrently using asyncio — far faster than sequential
+when your API rate limit allows it. Use benchmark_enrich.py first to find
+the right --max_concurrent for your tier.
 
-When Phase 2 adds standard 990 program descriptions, update
-description and set description_source = '990_program'. Then run:
-
-  UPDATE pf_grants SET embedding_status = 'PENDING'
-  WHERE grantee_id IN (
-    SELECT grantee_id FROM pf_grantees
-    WHERE description_source = '990_program'
-  )
-
-to trigger re-embedding with the richer text.
+Schema required
+---------------
+pf_grantees must have: description STRING, description_source STRING, updated_at TIMESTAMP
 
 Usage
 -----
@@ -22,20 +15,22 @@ python enrich_990pf.py \
     --project_id ai-agent-platform-496418 \
     --dataset_id query_dataset \
     [--limit 500] \
-    [--batch_size 20] \
-    [--call_delay 0.5] \
+    [--max_concurrent 5] \
     [--dry_run] \
     [--dry_run_limit 5]
 """
 
 import argparse
+import asyncio
 import logging
 import sys
 import time
-from itertools import islice
+from datetime import datetime, timezone
 
 import anthropic
 from google.cloud import bigquery
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -44,6 +39,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+MODEL          = "claude-haiku-4-5"
+BQ_CONCURRENCY = 10
 
 SYSTEM_PROMPT = """You are helping build a grant search tool for nonprofit
 fundraisers. Given information about a grantee organization, write one
@@ -55,7 +53,7 @@ Rules:
   is good. "provides support to the community" is not.
 - If the grantee name makes the work obvious, use that signal even if
   the purpose is vague.
-- If the purpose is specific, use it. If it's generic like
+- If the purpose is specific, use it. If it is generic like
   "PROVIDE OPERATING FUNDS", ignore it and infer from the name.
 - One sentence only. No preamble. No "This organization..."."""
 
@@ -65,91 +63,91 @@ Grant purpose: {purpose}
 Describe what the grantee does:"""
 
 
-def batched(items: list, size: int):
-    it = iter(items)
-    while chunk := list(islice(it, size)):
-        yield chunk
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def build_prompt(row: dict) -> str:
+    return USER_TEMPLATE.format(
+        grantee_name=row.get("grantee_name")   or "Unknown grantee",
+        grantee_state=row.get("grantee_state") or "unknown state",
+        purpose=row.get("sample_purpose")      or "not specified",
+    )
 
 
-def call_claude(client: anthropic.Anthropic, row: dict) -> str | None:
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=120,
-            system=SYSTEM_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": USER_TEMPLATE.format(
-                    grantee_name=row.get("grantee_name")  or "Unknown grantee",
-                    grantee_state=row.get("grantee_state") or "unknown state",
-                    purpose=row.get("sample_purpose")     or "not specified",
+# ── Async Claude call ─────────────────────────────────────────────────────────
+
+async def enrich_one(
+    client:    anthropic.AsyncAnthropic,
+    semaphore: asyncio.Semaphore,
+    row:       dict,
+    retries:   int = 2,
+) -> dict | None:
+    async with semaphore:
+        for attempt in range(retries + 1):
+            try:
+                response = await client.messages.create(
+                    model=MODEL,
+                    max_tokens=120,
+                    system=SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": build_prompt(row)}]
                 )
-            }]
-        )
-        return response.content[0].text.strip()
-    except anthropic.RateLimitError:
-        log.warning("Rate limited — sleeping 10s...")
-        time.sleep(10)
-        return None
-    except Exception as exc:
-        log.warning("Claude call failed for grantee %s: %s", row.get("grantee_id"), exc)
-        return None
+                return {
+                    "grantee_id":  row["grantee_id"],
+                    "description": response.content[0].text.strip(),
+                }
+            except anthropic.RateLimitError:
+                if attempt < retries:
+                    wait = 10 * (2 ** attempt)
+                    log.warning("Rate limited — waiting %ds (attempt %d/%d)...",
+                                wait, attempt + 1, retries)
+                    await asyncio.sleep(wait)
+                else:
+                    log.warning("Retries exhausted for %s",
+                                (row.get("grantee_name") or "?")[:30])
+                    return None
+            except Exception as exc:
+                log.warning("Failed for %s: %s",
+                            (row.get("grantee_name") or "?")[:30], exc)
+                return None
 
 
-def save_batch(
-    bq: bigquery.Client,
-    table: str,
-    updates: list[dict],
-    dry_run: bool,
-) -> None:
-    if not updates:
-        return
-    if dry_run:
-        for u in updates[:3]:
-            log.info("[dry_run] %s → %s", u["grantee_id"][:12], u["description"][:100])
-        if len(updates) > 3:
-            log.info("[dry_run] ...and %d more", len(updates) - 3)
-        return
+# ── Async BigQuery write ──────────────────────────────────────────────────────
 
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    for u in updates:
-        bq.query(
-            f"UPDATE `{table}` "
-            "SET description = @description, "
-            "    description_source = 'llm', "
-            "    updated_at = @updated_at "
-            "WHERE grantee_id = @grantee_id",
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ScalarQueryParameter("description", "STRING", u["description"]),
-                    bigquery.ScalarQueryParameter("updated_at",  "STRING", now),
-                    bigquery.ScalarQueryParameter("grantee_id",  "STRING", u["grantee_id"]),
-                ]
-            )
-        ).result()
+def _bq_write_one(bq: bigquery.Client, table: str, u: dict, now: str) -> None:
+    bq.query(
+        f"UPDATE `{table}` "
+        "SET description = @description, "
+        "    description_source = 'llm', "
+        "    updated_at = @updated_at "
+        "WHERE grantee_id = @grantee_id",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("description", "STRING",    u["description"]),
+            bigquery.ScalarQueryParameter("updated_at",  "TIMESTAMP", now),
+            bigquery.ScalarQueryParameter("grantee_id",  "STRING",    u["grantee_id"]),
+        ])
+    ).result()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--project_id",    required=True)
-    parser.add_argument("--dataset_id",    required=True)
-    parser.add_argument("--limit",         type=int,   default=500)
-    parser.add_argument("--batch_size",    type=int,   default=20)
-    parser.add_argument("--call_delay",    type=float, default=0.5)
-    parser.add_argument("--dry_run",       action="store_true")
-    parser.add_argument("--dry_run_limit", type=int,   default=5)
-    args = parser.parse_args()
+async def write_all(bq: bigquery.Client, table: str, updates: list[dict]) -> None:
+    now       = datetime.now(timezone.utc).isoformat()
+    semaphore = asyncio.Semaphore(BQ_CONCURRENCY)
 
-    bq     = bigquery.Client(project=args.project_id)
-    client = anthropic.Anthropic()
+    async def write_one(u: dict) -> None:
+        async with semaphore:
+            await asyncio.to_thread(_bq_write_one, bq, table, u, now)
 
-    grantees_table = f"{args.project_id}.{args.dataset_id}.pf_grantees"
-    grants_table   = f"{args.project_id}.{args.dataset_id}.pf_grants"
+    await asyncio.gather(*[write_one(u) for u in updates])
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+async def main_async(args: argparse.Namespace) -> None:
+    bq = bigquery.Client(project=args.project_id)
+
+    grantees_table  = f"{args.project_id}.{args.dataset_id}.pf_grantees"
+    grants_table    = f"{args.project_id}.{args.dataset_id}.pf_grants"
     effective_limit = args.dry_run_limit if args.dry_run else args.limit
 
-    # Fetch unenriched grantees, joining to grants to get a sample purpose
-    # for context (most recent grant purpose for that grantee)
+    # ── Fetch unenriched grantees ─────────────────────────────────────────────
     rows = [
         dict(r) for r in bq.query(f"""
             SELECT
@@ -161,13 +159,13 @@ def main() -> None:
             LEFT JOIN (
                 SELECT grantee_id, grant_purpose,
                        ROW_NUMBER() OVER (
-                           PARTITION BY grantee_id
-                           ORDER BY created_at DESC
+                           PARTITION BY grantee_id ORDER BY created_at DESC
                        ) AS rn
                 FROM `{grants_table}`
                 WHERE grant_purpose IS NOT NULL
             ) g ON g.grantee_id = gr.grantee_id AND g.rn = 1
             WHERE gr.description IS NULL
+              AND gr.grantee_name IS NOT NULL
             ORDER BY gr.grantee_id
             LIMIT {effective_limit}
         """).result()
@@ -177,39 +175,61 @@ def main() -> None:
         log.info("All grantees already have descriptions.")
         return
 
-    log.info("Enriching %d grantees...", len(rows))
-    total_enriched = total_failed = 0
+    log.info(
+        "Enriching %d grantees  model=%s  max_concurrent=%d",
+        len(rows), MODEL, args.max_concurrent,
+    )
 
-    for batch_num, batch in enumerate(batched(rows, args.batch_size), start=1):
-        log.info("Batch %d — %d grantees...", batch_num, len(batch))
-        updates = []
+    # ── Run all Claude calls in parallel ──────────────────────────────────────
+    client    = anthropic.AsyncAnthropic()
+    semaphore = asyncio.Semaphore(args.max_concurrent)
 
-        for row in batch:
-            description = call_claude(client, row)
-            time.sleep(args.call_delay)
+    start   = time.perf_counter()
+    results = await asyncio.gather(*[enrich_one(client, semaphore, row) for row in rows])
+    elapsed = time.perf_counter() - start
 
-            if not description:
-                total_failed += 1
-                continue
+    updates = [r for r in results if r is not None]
+    failed  = len(results) - len(updates)
 
-            log.info(
-                "  %s → %s",
-                (row.get("grantee_name") or "")[:35],
-                description[:90],
-            )
-            updates.append({
-                "grantee_id":  row["grantee_id"],
-                "description": description,
-            })
+    log.info(
+        "Done in %.1fs — %d enriched, %d failed",
+        elapsed, len(updates), failed,
+    )
 
-        save_batch(bq, grantees_table, updates, args.dry_run)
-        total_enriched += len(updates)
-        log.info("  Batch %d done — %d enriched, %d failed", batch_num, total_enriched, total_failed)
+    if not updates:
+        return
 
-        if batch_num * args.batch_size < len(rows):
-            time.sleep(1)
+    # ── Dry run ───────────────────────────────────────────────────────────────
+    if args.dry_run:
+        for u in updates[:3]:
+            log.info("[dry_run] %s → %s", u["grantee_id"][:12], u["description"][:100])
+        if len(updates) > 3:
+            log.info("[dry_run] ...and %d more", len(updates) - 3)
+        return
 
-    log.info("Done — %d enriched, %d failed", total_enriched, total_failed)
+    # ── Write to BigQuery ─────────────────────────────────────────────────────
+    log.info("Writing %d descriptions to BigQuery...", len(updates))
+    bq_start = time.perf_counter()
+    await write_all(bq, grantees_table, updates)
+    log.info("Wrote in %.1fs", time.perf_counter() - bq_start)
+
+    if failed:
+        log.info("%d grantees failed — re-run to retry them", failed)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Enrich pf_grantees with parallel Claude descriptions"
+    )
+    parser.add_argument("--project_id",     required=True)
+    parser.add_argument("--dataset_id",     required=True)
+    parser.add_argument("--limit",          type=int,   default=500)
+    parser.add_argument("--max_concurrent", type=int,   default=5,
+                        help="Max simultaneous Claude calls — match to your RPM limit")
+    parser.add_argument("--dry_run",        action="store_true")
+    parser.add_argument("--dry_run_limit",  type=int,   default=5)
+    args = parser.parse_args()
+    asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":
