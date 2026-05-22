@@ -47,7 +47,6 @@ Grant sizes: small=<$5K, medium=$5K-$25K, large=$25K-$100K, major=$100K+
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Retry once with stricter system prompt
         log.warning("Query decomposition failed — retrying...")
         retry = client.messages.create(
             model="claude-sonnet-4-5",
@@ -83,10 +82,6 @@ def build_pinecone_filter(
     filters: dict[str, Any] = {}
     states = states or []
 
-    # Filter on grantee_state (where funded org is located) not filer_state
-    # (where foundation is headquartered). This finds any foundation that has
-    # actually funded organizations in the target state — which is what a grant
-    # writer needs, not just foundations headquartered there.
     if len(states) == 1:
         filters["grantee_state_filter"] = {"$eq": states[0].upper()}
     elif len(states) > 1:
@@ -208,7 +203,6 @@ def search_grants(
 
     anthropic_client = anthropic.Anthropic()
 
-    # ── Query decomposition ───────────────────────────────────────────────────
     if use_decomposition:
         decomposed         = decompose_query(anthropic_client, query)
         semantic_query     = decomposed.get("semantic_query") or query
@@ -221,12 +215,11 @@ def search_grants(
         inferred_size      = None
         inferred_open_only = None
 
-    # Explicit args override LLM-extracted values
+    # Args override LLM-extracted values
     if state:       states        = [state.upper()]
     if grant_size:  inferred_size = grant_size
     if open_only:   inferred_open_only = True
 
-    # ── Embed + search ────────────────────────────────────────────────────────
     vertexai.init(project=PROJECT_ID, location=REGION)
     model        = TextEmbeddingModel.from_pretrained("text-embedding-004")
     query_vector = model.get_embeddings([semantic_query])[0].values
@@ -251,10 +244,7 @@ def search_grants(
 
     matches = results.get("matches", [])
 
-    # ── Rerank ────────────────────────────────────────────────────────────────
     # Only rerank when there are enough candidates to meaningfully reorder.
-    # With fewer than RERANK_THRESHOLD results the LLM adds latency and cost
-    # without improving quality — vector similarity is already doing all the work.
     RERANK_THRESHOLD = 10
 
     should_rerank = (

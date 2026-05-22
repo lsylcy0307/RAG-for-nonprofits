@@ -1,13 +1,7 @@
 """
-Enrich pf_grantees with LLM-generated descriptions (parallel).
+Enrich pf_grantees with LLM-generated descriptions.
 
-Runs Claude calls concurrently using asyncio — far faster than sequential
-when your API rate limit allows it. Use benchmark_enrich.py first to find
-the right --max_concurrent for your tier.
-
-Schema required
----------------
-pf_grantees must have: description STRING, description_source STRING, updated_at TIMESTAMP
+Runs Claude calls concurrently using asyncio.
 
 Usage
 -----
@@ -29,8 +23,6 @@ from datetime import datetime, timezone
 
 import anthropic
 from google.cloud import bigquery
-
-# ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -63,17 +55,12 @@ Grant purpose: {purpose}
 Describe what the grantee does:"""
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def build_prompt(row: dict) -> str:
     return USER_TEMPLATE.format(
         grantee_name=row.get("grantee_name")   or "Unknown grantee",
         grantee_state=row.get("grantee_state") or "unknown state",
         purpose=row.get("sample_purpose")      or "not specified",
     )
-
-
-# ── Async Claude call ─────────────────────────────────────────────────────────
 
 async def enrich_one(
     client:    anthropic.AsyncAnthropic,
@@ -109,9 +96,6 @@ async def enrich_one(
                             (row.get("grantee_name") or "?")[:30], exc)
                 return None
 
-
-# ── Async BigQuery write ──────────────────────────────────────────────────────
-
 def _bq_write_one(bq: bigquery.Client, table: str, u: dict, now: str) -> None:
     bq.query(
         f"UPDATE `{table}` "
@@ -137,9 +121,6 @@ async def write_all(bq: bigquery.Client, table: str, updates: list[dict]) -> Non
 
     await asyncio.gather(*[write_one(u) for u in updates])
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 async def main_async(args: argparse.Namespace) -> None:
     bq = bigquery.Client(project=args.project_id)
 
@@ -147,7 +128,6 @@ async def main_async(args: argparse.Namespace) -> None:
     grants_table    = f"{args.project_id}.{args.dataset_id}.pf_grants"
     effective_limit = args.dry_run_limit if args.dry_run else args.limit
 
-    # ── Fetch unenriched grantees ─────────────────────────────────────────────
     rows = [
         dict(r) for r in bq.query(f"""
             SELECT
@@ -180,7 +160,6 @@ async def main_async(args: argparse.Namespace) -> None:
         len(rows), MODEL, args.max_concurrent,
     )
 
-    # ── Run all Claude calls in parallel ──────────────────────────────────────
     client    = anthropic.AsyncAnthropic()
     semaphore = asyncio.Semaphore(args.max_concurrent)
 
@@ -199,7 +178,6 @@ async def main_async(args: argparse.Namespace) -> None:
     if not updates:
         return
 
-    # ── Dry run ───────────────────────────────────────────────────────────────
     if args.dry_run:
         for u in updates[:3]:
             log.info("[dry_run] %s → %s", u["grantee_id"][:12], u["description"][:100])
@@ -207,7 +185,6 @@ async def main_async(args: argparse.Namespace) -> None:
             log.info("[dry_run] ...and %d more", len(updates) - 3)
         return
 
-    # ── Write to BigQuery ─────────────────────────────────────────────────────
     log.info("Writing %d descriptions to BigQuery...", len(updates))
     bq_start = time.perf_counter()
     await write_all(bq, grantees_table, updates)

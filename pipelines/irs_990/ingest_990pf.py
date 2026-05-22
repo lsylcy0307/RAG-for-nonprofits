@@ -28,8 +28,6 @@ import xml.etree.ElementTree as ET
 
 from google.cloud import bigquery, storage
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-
 logging.basicConfig(
     stream=sys.stdout,
     level=logging.INFO,
@@ -49,9 +47,6 @@ _GENERIC_PURPOSES = {
     "charitable contribution", "charitable purposes",
     "charitable support", "n/a", "none",
 }
-
-
-# ── Utilities ─────────────────────────────────────────────────────────────────
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -92,9 +87,6 @@ def _build_embed_text(filer_name, filer_state, grantee_name, grantee_state, purp
     if purpose and not _is_generic(purpose):
         parts.append(purpose)
     return " | ".join(p for p in parts if p)
-
-
-# ── Parser ────────────────────────────────────────────────────────────────────
 
 def parse_990pf(
     xml_bytes: bytes,
@@ -219,12 +211,6 @@ def parse_990pf(
     return foundation_row, grantee_rows, grant_rows
 
 
-# ── BigQuery helpers ──────────────────────────────────────────────────────────
-#
-# All inserts use DML (not streaming) so rows are immediately mutable.
-# Explicit column→type mapping per table — no type inference from Python values
-# since None always looks like STRING and causes type mismatch errors.
-
 def _p(name: str, bq_type: str, val: Any) -> "bigquery.ScalarQueryParameter":
     return bigquery.ScalarQueryParameter(name, bq_type, val)
 
@@ -346,15 +332,13 @@ def insert_new_grantees(
             log.info("[dry_run] Would upsert %d grantees into %s", len(grantees), table_id)
         return
 
-    # Deduplicate within this batch first
-    seen:   set[str]            = set()
+    seen: set[str] = set()
     unique: list[dict[str, Any]] = []
     for g in grantees:
         if g["grantee_id"] not in seen:
             seen.add(g["grantee_id"])
             unique.append(g)
 
-    # Check which grantee_ids already exist in BigQuery
     ids_sql  = ", ".join(f"'{g['grantee_id']}'" for g in unique)
     existing = {
         row["grantee_id"]
@@ -403,9 +387,6 @@ def insert_new_grantees(
         ).result()
         log.info("  Inserted %d new grantees (%d already existed)", len(new_grantees), len(existing))
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
 def ingest_gcs_prefix(
     project_id: str,
     dataset_id: str,
@@ -430,7 +411,6 @@ def ingest_gcs_prefix(
 
     log.info("Found %d XML files under gs://%s/%s", len(xml_blobs), bucket_name, prefix)
 
-    # Fetch already-ingested filenames in one query so we can skip duplicates
     already_ingested: set[str] = set()
     if not dry_run:
         already_ingested = {

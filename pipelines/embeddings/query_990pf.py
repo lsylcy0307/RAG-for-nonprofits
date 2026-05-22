@@ -18,7 +18,7 @@ python query_990pf.py \
 
 Query decomposition
 -------------------
-The script uses an LLM to extract filters from natural language before
+The script uses an LLM to extract filters from natural language query before
 searching, so explicit flags are optional. For example:
 
   --query "open foundations funding food banks in Texas under $10K"
@@ -39,8 +39,6 @@ from google.cloud import bigquery
 from pinecone import Pinecone
 from vertexai.language_models import TextEmbeddingModel
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-
 logging.basicConfig(
     stream=sys.stdout,
     level=logging.INFO,
@@ -51,35 +49,8 @@ log = logging.getLogger(__name__)
 
 PINECONE_NAMESPACE = "pf_grants"
 
-US_STATES = {
-    "alabama":"AL","alaska":"AK","arizona":"AZ","arkansas":"AR",
-    "california":"CA","colorado":"CO","connecticut":"CT","delaware":"DE",
-    "florida":"FL","georgia":"GA","hawaii":"HI","idaho":"ID",
-    "illinois":"IL","indiana":"IN","iowa":"IA","kansas":"KS",
-    "kentucky":"KY","louisiana":"LA","maine":"ME","maryland":"MD",
-    "massachusetts":"MA","michigan":"MI","minnesota":"MN","mississippi":"MS",
-    "missouri":"MO","montana":"MT","nebraska":"NE","nevada":"NV",
-    "new hampshire":"NH","new jersey":"NJ","new mexico":"NM","new york":"NY",
-    "north carolina":"NC","north dakota":"ND","ohio":"OH","oklahoma":"OK",
-    "oregon":"OR","pennsylvania":"PA","rhode island":"RI","south carolina":"SC",
-    "south dakota":"SD","tennessee":"TN","texas":"TX","utah":"UT",
-    "vermont":"VT","virginia":"VA","washington":"WA","west virginia":"WV",
-    "wisconsin":"WI","wyoming":"WY",
-    # regions → list of state codes
-    "southeast":   ["FL","GA","SC","NC","VA","TN","AL","MS"],
-    "southwest":   ["TX","AZ","NM","OK","NV"],
-    "northeast":   ["NY","NJ","CT","MA","RI","VT","NH","ME","PA","MD","DE"],
-    "midwest":     ["IL","OH","MI","IN","WI","MN","IA","MO","ND","SD","NE","KS"],
-    "west":        ["CA","OR","WA","CO","UT","ID","MT","WY","AK","HI"],
-    "new england": ["MA","CT","RI","VT","NH","ME"],
-    "mid-atlantic":["NY","NJ","PA","MD","DE"],
-    "appalachia":  ["WV","KY","TN","VA","NC","OH","PA"],
-}
-
 VALID_SIZES = ["small","medium","large","major"]
 
-
-# ── Query decomposition ───────────────────────────────────────────────────────
 
 def decompose_query(client: anthropic.Anthropic, query: str) -> dict:
     """
@@ -114,7 +85,6 @@ Return only valid JSON, no explanation."""
 
     text = response.content[0].text.strip()
 
-    # Strip markdown code fences if Claude wrapped the JSON
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
@@ -124,7 +94,6 @@ Return only valid JSON, no explanation."""
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Retry once with a stricter prompt
         log.warning("First decomposition attempt returned non-JSON — retrying...")
         retry = client.messages.create(
             model="claude-sonnet-4-5",
@@ -151,8 +120,6 @@ Return only valid JSON, no explanation."""
                 "open_only":  None,
             }
 
-
-# ── Reranking ─────────────────────────────────────────────────────────────────
 
 def rerank(
     client: anthropic.Anthropic,
@@ -206,8 +173,6 @@ def rerank(
         return matches[:top_n]
 
 
-# ── Display ───────────────────────────────────────────────────────────────────
-
 def format_amount(raw: str | None) -> str:
     try:
         return f"${int(raw):,}"
@@ -223,9 +188,6 @@ def format_assets(raw: str | None) -> str:
     except (TypeError, ValueError):
         return "assets not reported"
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Search 990-PF grant data")
     parser.add_argument("--project_id", required=True)
@@ -240,7 +202,6 @@ def main() -> None:
                         help="Only return foundations that accept unsolicited proposals")
     args = parser.parse_args()
 
-    # ── Clients ───────────────────────────────────────────────────────────────
     anthropic_client = anthropic.Anthropic()
     vertexai.init(project=args.project_id, location=args.region)
     model = TextEmbeddingModel.from_pretrained("text-embedding-004")
@@ -248,7 +209,6 @@ def main() -> None:
         os.environ["PINECONE_INDEX_NAME"]
     )
 
-    # ── Query decomposition ───────────────────────────────────────────────────
     log.info("Decomposing query...")
     decomposed = decompose_query(anthropic_client, args.query)
 
@@ -257,7 +217,6 @@ def main() -> None:
     grant_size     = decomposed.get("grant_size")
     open_only      = decomposed.get("open_only")
 
-    # Explicit flags override LLM extraction
     if args.state:
         states = [args.state.upper()]
     if args.grant_size:
@@ -270,7 +229,6 @@ def main() -> None:
         semantic_query, states or "any", grant_size or "any", open_only,
     )
 
-    # ── Build Pinecone filter ─────────────────────────────────────────────────
     pinecone_top_k = args.top_k * 4   # fetch more for reranker
     pinecone_filter: dict = {}
 
@@ -285,7 +243,6 @@ def main() -> None:
     if open_only:
         pinecone_filter["open_to_apply"] = {"$eq": True}
 
-    # ── Embed query + search ──────────────────────────────────────────────────
     query_vector = model.get_embeddings([semantic_query])[0].values
 
     results = index.query(
@@ -302,7 +259,6 @@ def main() -> None:
         print("\nNo results found. Try broadening your query or removing filters.")
         return
 
-    # ── Rerank ────────────────────────────────────────────────────────────────
     # Only rerank when there are enough candidates to meaningfully reorder.
     RERANK_THRESHOLD = 10
 
@@ -321,7 +277,6 @@ def main() -> None:
         )
         matches = matches[:args.top_k]
 
-    # ── Display ───────────────────────────────────────────────────────────────
     print(f'\nQuery: "{args.query}"')
     if states or grant_size or open_only:
         active = []
