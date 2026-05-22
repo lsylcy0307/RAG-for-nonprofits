@@ -220,21 +220,115 @@ def parse_990pf(
 
 
 # ── BigQuery helpers ──────────────────────────────────────────────────────────
+#
+# All inserts use DML (not streaming) so rows are immediately mutable.
+# Explicit column→type mapping per table — no type inference from Python values
+# since None always looks like STRING and causes type mismatch errors.
+
+def _p(name: str, bq_type: str, val: Any) -> "bigquery.ScalarQueryParameter":
+    return bigquery.ScalarQueryParameter(name, bq_type, val)
+
+
+def insert_foundation(
+    client:   bigquery.Client,
+    table_id: str,
+    row:      dict[str, Any],
+) -> None:
+    """Insert one pf_foundations row via DML."""
+    client.query(
+        f"INSERT INTO `{table_id}` "
+        "(foundation_id, ein, organization_name, filing_year, tax_period, state, "
+        " fmv_assets_raw, total_revenue_raw, total_expenses_raw, total_grants_paid_raw, "
+        " accepts_unsolicited_apps, xml_filename, gcs_path, created_at) "
+        "VALUES (@foundation_id, @ein, @organization_name, @filing_year, @tax_period, @state, "
+        " @fmv_assets_raw, @total_revenue_raw, @total_expenses_raw, @total_grants_paid_raw, "
+        " @accepts_unsolicited_apps, @xml_filename, @gcs_path, @created_at)",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            _p("foundation_id",         "STRING",    row["foundation_id"]),
+            _p("ein",                   "STRING",    row["ein"]),
+            _p("organization_name",     "STRING",    row.get("organization_name") or ""),
+            _p("filing_year",           "INT64",     row.get("filing_year")),
+            _p("tax_period",            "STRING",    row.get("tax_period") or ""),
+            _p("state",                 "STRING",    row.get("state") or ""),
+            _p("fmv_assets_raw",        "STRING",    row.get("fmv_assets_raw") or ""),
+            _p("total_revenue_raw",     "STRING",    row.get("total_revenue_raw") or ""),
+            _p("total_expenses_raw",    "STRING",    row.get("total_expenses_raw") or ""),
+            _p("total_grants_paid_raw", "STRING",    row.get("total_grants_paid_raw") or ""),
+            _p("accepts_unsolicited_apps", "BOOL",   row.get("accepts_unsolicited_apps")),
+            _p("xml_filename",          "STRING",    row.get("xml_filename") or ""),
+            _p("gcs_path",              "STRING",    row.get("gcs_path") or ""),
+            _p("created_at",            "TIMESTAMP", row["created_at"]),
+        ])
+    ).result()
+
+
+def insert_grants(
+    client:   bigquery.Client,
+    table_id: str,
+    rows:     list[dict[str, Any]],
+) -> None:
+    """Insert pf_grants rows via batched DML (one query for all rows)."""
+    if not rows:
+        return
+
+    select_parts: list[str] = []
+    params:       list      = []
+
+    for i, row in enumerate(rows):
+        select_parts.append(
+            f"SELECT @grant_id_{i}, @foundation_id_{i}, @grantee_id_{i}, "
+            f"       @filer_ein_{i}, @filer_name_{i}, @filer_state_{i}, "
+            f"       @grantee_name_{i}, @grantee_city_{i}, @grantee_state_{i}, "
+            f"       @grant_amount_raw_{i}, @grant_purpose_{i}, "
+            f"       @embed_text_{i}, @embedding_status_{i}, @created_at_{i}"
+        )
+        params.extend([
+            _p(f"grant_id_{i}",         "STRING",    row["grant_id"]),
+            _p(f"foundation_id_{i}",    "STRING",    row["foundation_id"]),
+            _p(f"grantee_id_{i}",       "STRING",    row["grantee_id"]),
+            _p(f"filer_ein_{i}",        "STRING",    row.get("filer_ein") or ""),
+            _p(f"filer_name_{i}",       "STRING",    row.get("filer_name") or ""),
+            _p(f"filer_state_{i}",      "STRING",    row.get("filer_state") or ""),
+            _p(f"grantee_name_{i}",     "STRING",    row.get("grantee_name") or ""),
+            _p(f"grantee_city_{i}",     "STRING",    row.get("grantee_city") or ""),
+            _p(f"grantee_state_{i}",    "STRING",    row.get("grantee_state") or ""),
+            _p(f"grant_amount_raw_{i}", "STRING",    row.get("grant_amount_raw") or ""),
+            _p(f"grant_purpose_{i}",    "STRING",    row.get("grant_purpose") or ""),
+            _p(f"embed_text_{i}",       "STRING",    row.get("embed_text") or ""),
+            _p(f"embedding_status_{i}", "STRING",    row.get("embedding_status") or "PENDING"),
+            _p(f"created_at_{i}",       "TIMESTAMP", row["created_at"]),
+        ])
+
+    union_sql = " UNION ALL ".join(select_parts)
+    client.query(
+        f"INSERT INTO `{table_id}` "
+        "(grant_id, foundation_id, grantee_id, filer_ein, filer_name, filer_state, "
+        " grantee_name, grantee_city, grantee_state, grant_amount_raw, grant_purpose, "
+        " embed_text, embedding_status, created_at) "
+        f"{union_sql}",
+        job_config=bigquery.QueryJobConfig(query_parameters=params)
+    ).result()
+
 
 def insert_rows(
-    client: bigquery.Client,
+    client:   bigquery.Client,
     table_id: str,
-    rows: list[dict[str, Any]],
-    dry_run: bool = False,
+    rows:     list[dict[str, Any]],
+    dry_run:  bool = False,
 ) -> None:
+    """Dispatcher — routes to the correct explicit insert function."""
     if not rows:
         return
     if dry_run:
         log.info("[dry_run] Would insert %d rows into %s", len(rows), table_id)
         return
-    errors = client.insert_rows_json(table_id, rows)
-    if errors:
-        raise RuntimeError(f"BigQuery insert failed for {table_id}: {errors}")
+    if "pf_foundations" in table_id:
+        for row in rows:
+            insert_foundation(client, table_id, row)
+    elif "pf_grants" in table_id:
+        insert_grants(client, table_id, rows)
+    else:
+        raise ValueError(f"No explicit insert defined for {table_id}")
 
 
 def insert_new_grantees(
@@ -274,33 +368,39 @@ def insert_new_grantees(
     new_grantees = [g for g in unique if g["grantee_id"] not in existing]
 
     if new_grantees:
-        # Use DML INSERT (not streaming) so rows are immediately mutable.
-        # Streaming inserts go into a buffer that BigQuery won't let you
-        # UPDATE/DELETE for up to 90 minutes — enrich_990pf.py needs to
-        # UPDATE these rows right after ingest.
-        #
-        # Use parameterized queries to handle ALL special characters
-        # (apostrophes, quotes, backslashes) without manual escaping.
-        for g in new_grantees:
-            client.query(
-                f"""
-                INSERT INTO `{table_id}`
-                    (grantee_id, grantee_name, grantee_state, grantee_city,
-                     description, description_source, created_at, updated_at)
-                VALUES
-                    (@grantee_id, @grantee_name, @grantee_state, @grantee_city,
-                     NULL, NULL, @created_at, NULL)
-                """,
-                job_config=bigquery.QueryJobConfig(
-                    query_parameters=[
-                        bigquery.ScalarQueryParameter("grantee_id",    "STRING", g["grantee_id"]),
-                        bigquery.ScalarQueryParameter("grantee_name",  "STRING", g.get("grantee_name")  or ""),
-                        bigquery.ScalarQueryParameter("grantee_state", "STRING", g.get("grantee_state") or ""),
-                        bigquery.ScalarQueryParameter("grantee_city",  "STRING", g.get("grantee_city")  or ""),
-                        bigquery.ScalarQueryParameter("created_at",    "STRING", g["created_at"]),
-                    ]
-                )
-            ).result()
+        # Batch all inserts into one query using UNION ALL.
+        # One round trip regardless of how many grantees — Molina Healthcare
+        # had 137 grantees which caused 137 sequential BQ calls (very slow).
+        # BigQuery parameterized queries don't support multi-row VALUES, so
+        # we build a SELECT ... UNION ALL ... query from struct literals.
+        # Each row uses individual named parameters to stay safe from injection.
+        select_parts = []
+        params       = []
+
+        for i, g in enumerate(new_grantees):
+            select_parts.append(
+                f"SELECT @grantee_id_{i}, @grantee_name_{i}, @grantee_state_{i}, "
+                f"       @grantee_city_{i}, CAST(NULL AS STRING), CAST(NULL AS STRING), "
+                f"       @created_at_{i}, CAST(NULL AS TIMESTAMP)"
+            )
+            params.extend([
+                _p(f"grantee_id_{i}",    "STRING",    g["grantee_id"]),
+                _p(f"grantee_name_{i}",  "STRING",    g.get("grantee_name")  or ""),
+                _p(f"grantee_state_{i}", "STRING",    g.get("grantee_state") or ""),
+                _p(f"grantee_city_{i}",  "STRING",    g.get("grantee_city")  or ""),
+                _p(f"created_at_{i}",    "TIMESTAMP", g["created_at"]),
+            ])
+
+        union_sql = " UNION ALL ".join(select_parts)
+        client.query(
+            f"""
+            INSERT INTO `{table_id}`
+                (grantee_id, grantee_name, grantee_state, grantee_city,
+                 description, description_source, created_at, updated_at)
+            {union_sql}
+            """,
+            job_config=bigquery.QueryJobConfig(query_parameters=params)
+        ).result()
         log.info("  Inserted %d new grantees (%d already existed)", len(new_grantees), len(existing))
 
 
@@ -330,9 +430,29 @@ def ingest_gcs_prefix(
 
     log.info("Found %d XML files under gs://%s/%s", len(xml_blobs), bucket_name, prefix)
 
-    ok = failed = 0
+    # Fetch already-ingested filenames in one query so we can skip duplicates
+    already_ingested: set[str] = set()
+    if not dry_run:
+        already_ingested = {
+            row["xml_filename"]
+            for row in bq_client.query(f"""
+                SELECT xml_filename
+                FROM `{foundations_table}`
+                WHERE xml_filename IS NOT NULL
+            """).result()
+        }
+        if already_ingested:
+            log.info("Skipping %d already-ingested files", len(already_ingested))
+
+    ok = failed = skipped = 0
 
     for blob in xml_blobs:
+        filename = Path(blob.name).name
+        if filename in already_ingested:
+            skipped += 1
+            log.debug("  Skipping %s — already ingested", filename)
+            continue
+
         log.info("Ingesting: %s", blob.name)
         try:
             xml_bytes = blob.download_as_bytes()
@@ -358,7 +478,7 @@ def ingest_gcs_prefix(
             log.warning("  ✗ Skipped %s: %s", blob.name, exc)
             failed += 1
 
-    log.info("Done — %d succeeded, %d failed", ok, failed)
+    log.info("Done — %d succeeded, %d failed, %d skipped (already ingested)", ok, failed, skipped)
 
 
 if __name__ == "__main__":
